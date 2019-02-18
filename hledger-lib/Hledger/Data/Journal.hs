@@ -584,7 +584,7 @@ journalCheckBalanceAssertions = either Just (const Nothing) . journalBalanceTran
 -- ******** runST
 -- ********* runExceptT
 -- ********** runReaderT
--- *********** balanceNoAssignmentTransactionB
+-- *********** balanceTransactionWithoutBalanceAssignmentB
 -- ************ balanceTransactionB [[Transaction.hs]]
 -- ************* balanceTransactionHelper
 -- ************** inferBalancingAmount
@@ -620,38 +620,27 @@ journalBalanceTransactions assrt j' =
           -- 1. Balance the transactions which don't have balance assignments,
           -- and collect their postings, plus the still-unbalanced transactions, in date order.
           sortedpsandts <- sortOn (either postingDate tdate) . concat <$>
-                           mapM' balanceNoAssignmentTransactionB (jtxns j)
+                           mapM' balanceTransactionWithoutBalanceAssignmentB (jtxns j)
           -- 2. Step through these, keeping running account balances, 
           -- performing balance assignments in and balancing the remaining transactions,
           -- and checking balance assertions. This last could be a separate pass
           -- but perhaps it's more efficient to do all at once.
-          void $ mapM' balanceAssignmentTransactionAndOrCheckAssertionsB sortedpsandts
+          void $ mapM' balanceTransactionWithBalanceAssignmentAndCheckAssertionsB sortedpsandts
         ts' <- lift $ getElems txns
         return j{jtxns=ts'} 
 
--- | If this transaction has no balance assignments, balance and store it
+-- | If this transaction has no balance assignments: balance and store it,
 -- and return its postings. If it can't be balanced, an error will be thrown.
---
--- It it has balance assignments, return it unchanged. If any posting has both 
--- a balance assignment and a custom date, an error will be thrown.
---
-balanceNoAssignmentTransactionB :: Transaction -> Balancing s [Either Posting Transaction]
-balanceNoAssignmentTransactionB t
+-- If it has balance assignments: return it unchanged to be processed later. 
+balanceTransactionWithoutBalanceAssignmentB :: Transaction -> Balancing s [Either Posting Transaction]
+balanceTransactionWithoutBalanceAssignmentB t
   | null (assignmentPostings t) = do
     styles <- R.reader bsStyles
     t' <- lift $ ExceptT $ return $ balanceTransaction (Just styles) t
     storeTransactionB t'
-    return [Left $ removePrices p | p <- tpostings t']
-
-  | otherwise = do
-    when (any (isJust . pdate) $ tpostings t) $  -- XXX check more carefully that date and assignment are on same posting ?
-      throwError $
-      unlines $
-      [ "postings may not have both a custom date and a balance assignment."
-      , "Write the posting amount explicitly, or remove the posting date:\n"
-      , showTransaction t
-      ]
-    return [Right $ t {tpostings = removePrices <$> tpostings t}]
+    -- let ps' = [removePrices p | p <- tpostings t']  XXX used to do this; not needed ?
+    return $ map Left $ tpostings t'
+  | otherwise = return [Right t]
 
 -- | This function is called in turn on each item in a date-ordered sequence 
 -- of postings (from already-balanced transactions) or transactions  
@@ -677,38 +666,60 @@ balanceNoAssignmentTransactionB t
 -- Will throw an error if a transaction can't be balanced,
 -- or if an illegal balance assignment is found (cf checkIllegalBalanceAssignment). 
 --
-balanceAssignmentTransactionAndOrCheckAssertionsB :: Either Posting Transaction -> Balancing s ()
-balanceAssignmentTransactionAndOrCheckAssertionsB (Left p) = do
-  checkIllegalBalanceAssignmentB p
+balanceTransactionWithBalanceAssignmentAndCheckAssertionsB :: Either Posting Transaction -> Balancing s ()
+balanceTransactionWithBalanceAssignmentAndCheckAssertionsB (Left p) =
   void $ addAmountAndCheckBalanceAssertionB return p
-balanceAssignmentTransactionAndOrCheckAssertionsB (Right t@Transaction{tpostings=ps}) = do
+balanceTransactionWithBalanceAssignmentAndCheckAssertionsB (Right t@Transaction{tpostings=ps}) = do
   mapM_ checkIllegalBalanceAssignmentB ps
-  ps' <- forM ps $ addAmountAndCheckBalanceAssertionB inferFromAssignmentB
+  -- let ps' = map removePrices ps  XXX used to do this; not needed ?
+  ps' <- forM ps $ addAmountAndCheckBalanceAssertionB inferAmountFromAssignmentB
   styles <- R.reader bsStyles
   storeTransactionB =<< 
     balanceTransactionB (fmap void . addToBalanceB) (Just styles) t{tpostings=ps'}
 
--- | Throw an error if this posting is trying to do a balance assignment and
--- the account does not allow balance assignments (because it is referenced
--- by a transaction modifier).
+-- XXX these should show position
+-- | Throw an error if this posting is trying to do an illegal balance assignment.
 checkIllegalBalanceAssignmentB :: Posting -> Balancing s ()
-checkIllegalBalanceAssignmentB p = do
+checkIllegalBalanceAssignmentB p = do 
+  checkBalanceAssignmentPostingDateB p
+  checkBalanceAssignmentUnassignableAccountB p
+  
+-- | Throw an error if this posting is trying to do a balance assignment and
+-- has a custom posting date (which makes amount inference too hard/impossible).
+checkBalanceAssignmentPostingDateB :: Posting -> Balancing s ()
+checkBalanceAssignmentPostingDateB p =
+  when (hasBalanceAssignment p && isJust (pdate p)) $ 
+    throwError $ unlines $
+      ["postings which are balance assignments may not have a custom date."
+      ,"Please write the posting amount explicitly, or remove the posting date:"
+      ,""
+      ,maybe (unlines $ showPostingLines p) showTransaction $ ptransaction p
+      ]
+
+-- | Throw an error if this posting is trying to do a balance assignment and
+-- the account does not allow balance assignments (eg because it is referenced
+-- by a transaction modifier, which might generate additional postings to it).
+checkBalanceAssignmentUnassignableAccountB :: Posting -> Balancing s ()
+checkBalanceAssignmentUnassignableAccountB p = do
   unassignable <- R.asks bsUnassignable
-  when (isAssignment p && paccount p `S.member` unassignable) $
-    throwError $
-    unlines $
-    [ "cannot assign amount to account "
-    , ""
-    , "    " ++ T.unpack (paccount p)
-    , ""
-    , "because it is also included in transaction modifiers."
-    ]
+  when (hasBalanceAssignment p && paccount p `S.member` unassignable) $
+    throwError $ unlines $
+      ["balance assignments cannot be used with accounts which are"
+      ,"posted to by transaction modifier rules (auto postings)."
+      ,"Please write the posting amount explicitly, or remove the rule."
+      ,""
+      ,"account: "++T.unpack (paccount p)
+      ,""
+      ,"transaction:"
+      ,""
+      ,maybe (unlines $ showPostingLines p) showTransaction $ ptransaction p
+      ]
 
 -- | If this posting has a missing amount and a balance assignment, use
 -- the running account balance to infer the amount required to satisfy
 -- the assignment.
-inferFromAssignmentB :: Posting -> Balancing s Posting
-inferFromAssignmentB p@Posting{paccount=acc} =
+inferAmountFromAssignmentB :: Posting -> Balancing s Posting
+inferAmountFromAssignmentB p@Posting{paccount=acc} =
   case pbalanceassertion p of
     Nothing -> return p
     Just ba | batotal ba -> do

@@ -308,7 +308,7 @@ realPostings :: Transaction -> [Posting]
 realPostings = filter isReal . tpostings
 
 assignmentPostings :: Transaction -> [Posting]
-assignmentPostings = filter isAssignment . tpostings
+assignmentPostings = filter hasBalanceAssignment . tpostings
 
 virtualPostings :: Transaction -> [Posting]
 virtualPostings = filter isVirtual . tpostings
